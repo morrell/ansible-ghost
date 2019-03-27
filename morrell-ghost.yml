@@ -1,0 +1,102 @@
+---
+# This playbook deploys the whole application stack in this site.
+- name: 
+  hosts: <<INPUT HOSTS>>
+  gather_facts: true
+  become: true
+
+  vars:
+    site_url: "<<INPUT SITEURL>>"
+    cb_email: "<<CERTBOT EMAIL>>"
+
+    container_port: 2368
+    # If using python3 otherwise comment out
+    pip_package: python3-pip
+    pip_executable: pip3
+    pip_install_packages:
+      - name: docker
+    certbot_admin_email: "{{ cb_email }}"
+    certbot_create_if_missing: true
+    certbot_create_standalone_stop_services: []
+    certbot_certs:
+      - domains:
+          - "{{ site_url }}"
+    nginx_vhosts:
+      - listen: "443 ssl http2"
+        server_name: "{{ site_url }}"
+        state: "present"
+        template: "{{ nginx_vhost_template }}"
+        filename: "{{ site_url }}.conf"
+        extra_parameters: |
+          location / {
+            proxy_set_header HOST $host;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_pass http://127.0.0.1:{{ container_port }};
+          }
+          ssl_certificate     /etc/letsencrypt/live/{{ site_url }}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/{{ site_url }}/privkey.pem;
+          ssl_protocols       TLSv1.1 TLSv1.2;
+          ssl_ciphers         HIGH:!aNULL:!MD5;
+  pre_tasks:
+    - name: Update apt cache.
+      apt: update_cache=true cache_valid_time=600
+      when: ansible_os_family == 'Debian'
+      changed_when: false
+
+    - name: Install dependencies (RedHat).
+      yum: name={{ item }} state=present
+      when: ansible_os_family == 'RedHat'
+      with_items:
+        - cronie
+        - epel-release
+
+    - name: Install cron (Debian).
+      apt: name=cron state=present
+      when: ansible_os_family == 'Debian'
+
+  roles:
+    - geerlingguy.docker
+    - geerlingguy.certbot
+    - geerlingguy.nginx
+    - geerlingguy.pip
+
+  tasks:
+    - name: Flush handlers in case any configs have changed.
+      meta: flush_handlers
+
+    - name: Create Ghost content directory
+      file:
+        path: /var/lib/ghost/content
+        state: directory
+    
+    - name: Ensure docker-py is removed
+      pip:
+        name: docker-py
+        state: absent
+
+    - name: Ensure Ghost container is running
+      docker_container:
+        name: ghost
+        state: started
+        image: ghost:alpine
+        exposed_ports: 
+          - "{{ container_port }}"
+        ports:
+          - "{{ container_port }}:{{ container_port }}"
+        volumes:
+          - "/var/lib/ghost/content:/var/lib/ghost/content"
+        env:
+          url: "https://{{ site_url }}"
+
+    - name: Wait for docker container to start
+      pause:
+        seconds: 5
+        
+    - name: Test secure connection to SSL domain.
+      uri:
+        url: "https://{{ site_url }}"
+        status_code: 200
+      delegate_to: localhost
+      become: false
